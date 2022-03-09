@@ -1,0 +1,237 @@
+#!/bin/bash
+# FAppImage - Fat AppImage creator
+# Copyright (C) 2022 Daniel Collins <solemnwarning@solemnwarning.net>
+#
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted provided that the following conditions are met:
+#
+# 1. Redistributions of source code must retain the above copyright notice,
+#    this list of conditions and the following disclaimer.
+#
+# 2. Redistributions in binary form must reproduce the above copyright notice,
+#    this list of conditions and the following disclaimer in the documentation
+#    and/or other materials provided with the distribution.
+#
+# 3. Neither the name of the copyright holder nor the names of its contributors
+#    may be used to endorse or promote products derived from this software
+#    without specific prior written permission.
+#
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+# AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+# IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+# ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+# LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+# CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+# SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+# INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+# CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+# ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+# POSSIBILITY OF SUCH DAMAGE.
+
+set -e
+
+BLKSIZE=512       # Block size (each chunk is aligned/padded to this)
+RESERVE_BLOCKS=4  # Number of blocks to reserve for the bootstrap script
+
+i386=""
+amd64=""
+arm=""
+aarch64=""
+output=""
+
+function usage()
+{
+	echo "Usage: $0 [OPTIONS] --output <output.AppImage>" 1>&2
+	echo "" 1>&2
+	echo "    --i386 <filename>     - Path to i386 (x86) AppImage" 1>&2
+	echo "    --amd64 <filename>    - Path to amd64 (x86_64/x64) AppImage" 1>&2
+	echo "    --arm <filename>      - Path to arm AppImage" 1>&2
+	echo "    --aarch64 <filename>  - Path to aarch64 (arm64) AppImage" 1>&2
+	
+	exit 64 # EX_USAGE
+}
+
+function duplicate-arg()
+{
+	echo "Duplicate '$1' option" 1>&2
+	usage
+}
+
+function require-arg()
+{
+	if [ $# -lt 2 ]
+	then
+		echo "Option '$1' requires an argument" 1>&2
+		usage
+	fi
+}
+
+# https://stackoverflow.com/a/14203146
+while [[ $# -gt 0 ]]; do
+	case $1 in
+		--i386)
+			require-arg "$@"
+			[ -n "$i386" ] && duplicate-arg "$@"
+			i386="$2"
+			shift # past argument
+			shift # past value
+			;;
+		--amd64)
+			require-arg "$@"
+			[ -n "$amd64" ] && duplicate-arg "$@"
+			amd64="$2"
+			shift # past argument
+			shift # past value
+			;;
+		--arm)
+			require-arg "$@"
+			[ -n "$arm" ] && duplicate-arg "$@"
+			arm="$2"
+			shift # past argument
+			shift # past value
+			;;
+		--aarch64)
+			require-arg "$@"
+			[ -n "$aarch64" ] && duplicate-arg "$@"
+			aarch64="$2"
+			shift # past argument
+			shift # past value
+			;;
+		--output)
+			require-arg "$@"
+			[ -n "$output" ] && duplicate-arg "$@"
+			output="$2"
+			shift # past argument
+			shift # past value
+			;;
+		*)
+			echo "Unknown option $1" 1>&2
+			usage
+			;;
+	esac
+done
+
+if [ -z "${i386}${amd64}${arm}${aarch64}" ]
+then
+	echo "At least one of --i386/--amd64/--arm/--aarch64 must be specified" 1>&2
+	usage
+fi
+
+if [ -z "${output}" ]
+then
+	echo "--output must be specified" 1>&2
+	usage
+fi
+
+function filesize()
+{
+	local size=$(wc -c "$1" | awk '{print $1}')
+	if [ -z "$size" ]
+	then
+		exit 66 # EX_NOINPUT
+	fi
+	
+	echo $size
+}
+
+function calc_blocks()
+{
+	if [ "$(($1 % $BLKSIZE))" -eq 0 ]
+	then
+		echo $(($1 / $BLKSIZE))
+	else
+		echo $((($1 / $BLKSIZE) + 1))
+	fi
+}
+
+# Write out the bootstrap script.
+
+BOOTSTRAP_HEAD=$(cat <<'EOF'
+#!/bin/sh
+# https://github.com/solemnwarning/fappimage
+
+machine="$(uname -m)"
+
+case "$machine" in
+EOF
+)
+
+BOOTSTRAP_ARCH=$(cat <<'EOF'
+	%ARCH%)
+		tmpfile=$(mktemp)
+		dd if="$0" of="$tmpfile" bs=%BLKSIZE% skip=%SKIP% count=%BLOCKS% status=none
+		truncate -s %SIZE% "$tmpfile"
+		chmod +x "$tmpfile"
+		"$tmpfile" "$@"
+		s=$?
+		rm "$tmpfile"
+		exit $s
+		;;
+EOF
+)
+
+BOOTSTRAP_TAIL=$(cat <<'EOF'
+	*)
+		echo "Unsupported machine type: $machine" 1>&2
+		exit 1
+		;;
+esac
+EOF
+)
+
+data_off=$RESERVE_BLOCKS
+
+function prepare-arch()
+{
+	size=$(filesize "$2")
+	blocks=$(calc_blocks $size)
+	
+	sed \
+		-e "s/%ARCH%/$1/g" \
+		-e "s/%BLKSIZE%/$BLKSIZE/g" \
+		-e "s/%SKIP%/$data_off/g" \
+		-e "s/%BLOCKS%/$blocks/g" \
+		-e "s/%SIZE%/$size/g" \
+		<<< "$BOOTSTRAP_ARCH" >> "$output"
+	
+	data_off=$(($data_off + $blocks))
+}
+
+cat <<< "$BOOTSTRAP_HEAD" > "$output"
+
+bootstrap_size=$(filesize "$output")
+if [ "$bootstrap_size" -gt $(($RESERVE_BLOCKS * $BLKSIZE)) ]
+then
+	echo "ERROR: Bootstrap overflowed reserved space! Increase RESERVE_BLOCKS" 1>&2
+	exit 70 # EX_SOFTWARE
+fi
+
+[ -n "$i386" ]     && prepare-arch "i386|i686"        "$i386"
+[ -n "$amd64" ]    && prepare-arch "x86_64"           "$amd64"
+[ -n "$aarch64" ]  && prepare-arch "aarch64*|armv8*"  "$aarch64"
+[ -n "$arm" ]      && prepare-arch "arm*"             "$arm"
+
+cat <<< "$BOOTSTRAP_TAIL" >> "$output"
+
+# Append the AppImage bundles after the bootstrap.
+
+data_off=$RESERVE_BLOCKS
+
+function embed-arch
+{
+	size=$(filesize "$1")
+	blocks=$(calc_blocks $size)
+	
+	dd if="$1" of="$output" bs="$BLKSIZE" seek="$data_off" status=none
+	data_off=$(($data_off + $blocks))
+	
+	# Round up the file size to include any padding
+	truncate -s $(($data_off * $BLKSIZE)) "$output"
+}
+
+[ -n "$i386" ]     && embed-arch "$i386"
+[ -n "$amd64" ]    && embed-arch "$amd64"
+[ -n "$aarch64" ]  && embed-arch "$aarch64"
+[ -n "$arm" ]      && embed-arch "$arm"
+
+chmod +x "$output"
